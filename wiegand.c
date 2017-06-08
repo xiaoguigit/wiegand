@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/irq.h>
 #include <linux/poll.h>
+#include <linux/kthread.h>
 
 #define WG_CMD_MAX_NR 		7 
 #define WG_CMD_MAGIC 		'x'
@@ -38,7 +39,7 @@ static int convert_finish_flag = 0;
 static struct timer_list refresh_timer;
 static int flag_timeout = 0;
 static int flag_recive_mode;
-
+static struct task_struct *wiegand_convert_task;
 
 struct wiegand_io  {
 	int pin_num;
@@ -70,7 +71,8 @@ static void refresh_timer_function(unsigned long data)
 	}else{
 		flag_recive_mode = WG_UNKNOWN_MODE;
 	}
-	recive_data_convert();
+	//recive_data_convert();
+	wake_up_process(wiegand_convert_task);
 	bit_count = 0;	
 }
 
@@ -676,7 +678,21 @@ static struct file_operations wiegand_fops = {
 	.poll = wiegand_poll,
 };
 
-
+static int wiegand_convert_thread(void *data)
+{
+	while(1){
+		set_current_state(TASK_UNINTERRUPTIBLE);//将当前的状态表示设置为休眠
+		if(kthread_should_stop()) 
+			break;
+		if(flag_recive_mode != WG_UNKNOWN_MODE){
+			recive_data_convert();
+			flag_recive_mode = WG_UNKNOWN_MODE;
+		}else{
+			schedule_timeout(HZ/10);// 100ms
+		}
+	}
+	return 0;
+}
 
 static int __init wiegand_init(void)
 {
@@ -713,8 +729,6 @@ static int __init wiegand_init(void)
 				printk("Cannot set the gpio to input mode. \n");
 				gpio_free(wiegand_set[i].pin_num);
 				goto out;
-			}else{
-				printk("set the gpio-%d to input mode. \n",wiegand_set[i].pin_num);
 			}
 
 		}else{
@@ -723,8 +737,6 @@ static int __init wiegand_init(void)
 				printk("Cannot set the gpio to output mode. \n");
 				gpio_free(wiegand_set[i].pin_num);
 				goto out;
-			}else{
-				printk("set the gpio-%d to output mode. \n",wiegand_set[i].pin_num);
 			}
 		}
 	}
@@ -748,7 +760,13 @@ static int __init wiegand_init(void)
 	//disable_irq_nosync(gpio_to_irq(wiegand_set[0].pin_num));
 	//disable_irq_nosync(gpio_to_irq(wiegand_set[1].pin_num));
 
-
+	wiegand_convert_task = kthread_create(wiegand_convert_thread, NULL, "wiegand_convert_task");
+	if(IS_ERR(wiegand_convert_task)){
+		printk("Unable to start kernel thread.\n");
+		err = PTR_ERR(wiegand_convert_task);
+		wiegand_convert_task = NULL;
+		goto out1;
+	}
 
 	return 0;
 out:
@@ -756,13 +774,29 @@ out:
 		gpio_free(wiegand_set[i].pin_num);
 	}
 	return -1;
-	
+
+out1:
+	del_timer(&refresh_timer);
+	for(i = 0; i < ARRAY_SIZE(wiegand_set); i++){
+		if(wiegand_set[i].flag_input){
+			free_irq(gpio_to_irq(wiegand_set[i].pin_num), &wiegand_set[i]);
+		}
+		gpio_free(wiegand_set[i].pin_num);
+	}
+	device_destroy(cls, devid);
+	class_destroy(cls);
+	cdev_del(&wiegand_cdev);
+	unregister_chrdev_region(devid, 1);
+	return -1;
 }
 
 static void __exit wiegand_exit(void)
 {
 	int i; 
-
+	if(wiegand_convert_task){
+		kthread_stop(wiegand_convert_task);
+		wiegand_convert_task = NULL;
+	}
 	del_timer(&refresh_timer);
 	for(i = 0; i < ARRAY_SIZE(wiegand_set); i++){
 		if(wiegand_set[i].flag_input){
@@ -782,7 +816,7 @@ module_init(wiegand_init);
 module_exit(wiegand_exit);
 
 
-MODULE_AUTHOR ("mr_xiaogui@163.com");
+MODULE_AUTHOR ("www.gzseeing.com");
 MODULE_DESCRIPTION("WIEGAND DRIVER");
 MODULE_LICENSE("GPL");
 
