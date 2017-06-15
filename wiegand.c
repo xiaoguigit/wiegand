@@ -13,7 +13,6 @@
 #include <linux/delay.h>
 #include <linux/irq.h>
 #include <linux/poll.h>
-#include <linux/kthread.h>
 
 #define WG_CMD_MAX_NR 		7 
 #define WG_CMD_MAGIC 		'x'
@@ -39,7 +38,6 @@ static int convert_finish_flag = 0;
 static struct timer_list refresh_timer;
 static int flag_timeout = 0;
 static int flag_recive_mode;
-static struct task_struct *wiegand_convert_task;
 
 struct wiegand_io  {
 	int pin_num;
@@ -71,8 +69,7 @@ static void refresh_timer_function(unsigned long data)
 	}else{
 		flag_recive_mode = WG_UNKNOWN_MODE;
 	}
-	//recive_data_convert();
-	wake_up_process(wiegand_convert_task);
+	recive_data_convert();
 	bit_count = 0;	
 }
 
@@ -118,10 +115,12 @@ static unsigned char even_parity_34(unsigned long long wg_data)
 			 even_val++;   
 		}   
 	}   
-	if((even_val & 0x01) == 0x01)
+
+	if((even_val % 2) != 0)
 		even_val = 1;   
 	else 
 		even_val = 0;   
+
 	return even_val; 
 }   
 
@@ -130,12 +129,12 @@ static unsigned char odd_parity_34(unsigned long long wg_data)
 {   
 	unsigned char i, odd_val;  
 	odd_val = 0; 
-	for(i = 0; i < 16; i++){
+	for(i = 1; i < 16; i++){
 		if(((wg_data >> i) & 0x01) == 0x01){   
 			odd_val++;   
 		}   
 	}   
-	if((odd_val & 0x01 ) == 0x01) 
+	if((odd_val % 2) != 0)
 		odd_val = 0;   
 	else
 		odd_val = 1;   
@@ -179,6 +178,7 @@ static unsigned char odd_parity_66(unsigned long long wg_data)
 static unsigned char wiegand_26_to_barcode(unsigned long *data)
 {
 	int i,even,odd,hid,pid;
+
 	//偶校验  
 	even = 0;    	
 	for(i = 1; i < 13;i++)    	{
@@ -206,13 +206,13 @@ static unsigned char wiegand_26_to_barcode(unsigned long *data)
 	//奇偶校验通过	
 	//hid转换
 	hid = 0;	
-	for(i = 1 ;i<=12;i++){
-		hid  |= (0x01 & wiegand[i]) << (12-i);
+	for(i = 1 ;i<=8;i++){
+		hid  |= (0x01 & wiegand[i]) << (8-i);
 	}
 
 	//pid转换
 	pid = 0;	
-	for(i = 13 ;i<25;i++){
+	for(i = 9 ;i<25;i++){
 		pid |= (0x01 & wiegand[i]) << (25-i-1);
 	}
 
@@ -242,7 +242,8 @@ static unsigned char wiegand_34_to_barcode(unsigned long *data)
 	
 	if(even != wiegand[0]){
 		bit_count = 0;	
-		goto error;      	
+		goto error;      
+		printk("even bit error\n");
 	}		
 
 	//寄校验     	 
@@ -254,6 +255,7 @@ static unsigned char wiegand_34_to_barcode(unsigned long *data)
 
 	if(odd != wiegand[33]) {	
 		bit_count = 0;	
+		printk("odd bit error\n");
 		goto error;     	 
 	}	
 
@@ -314,19 +316,20 @@ static unsigned char wiegand_66_to_barcode(unsigned long long *data)
 	//hid转换
 	hid = 0;	
 	for(i = 1 ;i<=32;i++){
-		hid  |= (0x01 & wiegand[i]) << (32-i);
+		hid  |= (unsigned long long )(0x01 & wiegand[i]) << (32-i);
 	}
 
 	//pid转换
 	pid = 0;	
-	for(i = 33 ;i<65;i++){
-		pid |= (0x01 & wiegand[i]) << (65-i-1);
+	for(i = 33 ;i<=65;i++){
+		pid  |= (unsigned long long )(0x01 & wiegand[i]) << (65-i-1);
 	}
+
 
 	bit_count = 0;	
 
 	*data = (hid << 32) | (pid);
-
+       //printk("recv 66 : %llu\n", *data);
 	return 0;
 error:	
 	printk("Parity Efficacy Error!\n");	
@@ -361,16 +364,19 @@ static void recive_data_convert(void)
 {
 	switch(flag_recive_mode){
 	case WG_26_MODE:
+		//printk("WG_26_MODE\n");
 		wiegand_26_to_barcode(&barcode);
 		convert_finish_flag = 1;
 		wake_up_interruptible(&read_waitq);  
 		break;
 	case WG_34_MODE:
+		//printk("WG_34_MODE\n");
 		wiegand_34_to_barcode(&barcode);
 		convert_finish_flag = 1;
 		wake_up_interruptible(&read_waitq); 
 		break;		
 	case WG_66_MODE:
+		//printk("WG_66_MODE\n");
 		wiegand_66_to_barcode(&barcode_66);
 		convert_finish_flag = 1;
 		wake_up_interruptible(&read_waitq); 
@@ -380,6 +386,8 @@ static void recive_data_convert(void)
 		break;
 	}
 }
+
+
 
 /* 
   * 韦根输入数据1  的输入中断函数 
@@ -415,7 +423,6 @@ static irqreturn_t wiegand_irq1(int irq, void *dev_id)  // data 0
 	bit_count++;
 	enable_irq(gpio_to_irq(wiegand_set[1].pin_num));
 	mod_timer(&refresh_timer, jiffies+HZ/4);  // 250ms
-
 	return IRQ_HANDLED;
 }
 
@@ -444,24 +451,25 @@ static void set_wiegand_data1(int val)
 static void wiegand_write_bit(int val)
 {
 	if(!val){
-		set_wiegand_data0(1);
+		set_wiegand_data0(1);  //由于硬件上接了反相器，故输出1为低跳变
 		udelay(100);
 		set_wiegand_data0(0);
-		//printk("0 ");
+		//printk("0");
 	}else{
 		set_wiegand_data1(1);
 		udelay(100);
 		set_wiegand_data1(0);
-		//printk("1 ");
+		//printk("1");
 	}
+	udelay(200);
 }
 
 
 static void wiegand_26_send(unsigned long wg_data)
 {
 	int i;
-	set_wiegand_data0(1);
-	set_wiegand_data1(1);
+	set_wiegand_data0(0);
+	set_wiegand_data1(0);
 	udelay(10);
 
 	//printk("wiegand_26_data:%ld\n",wg_data);
@@ -484,18 +492,17 @@ static void wiegand_26_send(unsigned long wg_data)
 		wiegand_write_bit(1);
 	else
 		wiegand_write_bit(0);
-
 	//resume
-	set_wiegand_data0(1);
-	set_wiegand_data1(1);
+	set_wiegand_data0(0);
+	set_wiegand_data1(0);
 }
 
 
 static void wiegand_34_send(unsigned long long wg_data)   
 { 
 	int i;  
-	set_wiegand_data0(1);
-	set_wiegand_data1(1);
+	set_wiegand_data0(0);
+	set_wiegand_data1(0);
 	udelay(10);
 
 	//printk("wiegand_34_data:%llu\n",wg_data);
@@ -504,7 +511,7 @@ static void wiegand_34_send(unsigned long long wg_data)
 		wiegand_write_bit(1);
 	else 
 		wiegand_write_bit(0);
-	
+
 
 	//send data
 	for(i = 31; i >= 0; i--){
@@ -521,19 +528,19 @@ static void wiegand_34_send(unsigned long long wg_data)
 		wiegand_write_bit(0);
 
 	//resume
-	set_wiegand_data0(1);
-	set_wiegand_data1(1);
+	set_wiegand_data0(0);
+	set_wiegand_data1(0);
 }
 
 
 static void wiegand_66_send(unsigned long long wg_data)   
 { 
 	int i;  
-	set_wiegand_data0(1);
-	set_wiegand_data1(1);
+	set_wiegand_data0(0);
+	set_wiegand_data1(0);
 	udelay(10);
 
-	//printk("wiegand_66_data:%llu\n",wg_data);
+	//printk("wiegand_66_send_data:%llu\n",wg_data);
 	//Even bit
 	if(even_parity_66(wg_data) == 1)
 		wiegand_write_bit(1);
@@ -556,8 +563,8 @@ static void wiegand_66_send(unsigned long long wg_data)
 		wiegand_write_bit(0);
 
 	//resume
-	set_wiegand_data0(1);
-	set_wiegand_data1(1);
+	set_wiegand_data0(0);
+	set_wiegand_data1(0);
 }
 
 static int wiegand_open(struct inode *inode, struct file *file)
@@ -572,7 +579,9 @@ static int wiegand_open(struct inode *inode, struct file *file)
   */
 static long wiegand_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 {
+
 	int err = 0;
+	#if 1
 	unsigned char barcode[4];
 	unsigned long wiegand_code_26;
 	unsigned long long wiegand_code_34;
@@ -585,13 +594,16 @@ static long wiegand_ioctl(struct file *filep, unsigned int cmd, unsigned long ar
 
 	switch(cmd){
 	case WG_26_MODE:
+		//printk("\nmode :  %d\n", 26);
 		if(copy_from_user(barcode, (unsigned char*)arg, 3)){
 			return -EFAULT;
 		}
 		wiegand_code_26 = barcode_to_wiegand_26(barcode,3);
 		wiegand_26_send(wiegand_code_26);
+		
 		break;
 	case WG_34_MODE:
+		//printk("mode :  %d\n", 34);
 		if(copy_from_user(barcode, (unsigned char*)arg, 4)){
 			return -EFAULT;
 		}
@@ -599,6 +611,7 @@ static long wiegand_ioctl(struct file *filep, unsigned int cmd, unsigned long ar
 		wiegand_34_send(wiegand_code_34);
 		break;
 	case WG_66_MODE:
+		//printk("mode :  %d\n", 66);
 		if(copy_from_user(&wiegand_code_66, (unsigned char*)arg, 8)){
 			return -EFAULT;
 		}
@@ -609,6 +622,7 @@ static long wiegand_ioctl(struct file *filep, unsigned int cmd, unsigned long ar
 		err =  -1;
 		break;
 	}
+	#endif
 	return err;
 }
 
@@ -625,7 +639,7 @@ ssize_t wiegand_read(struct file *file, char __user *buf, size_t size, loff_t *p
 	wait_event_interruptible(read_waitq, convert_finish_flag);//数据未转换完成，在此休眠等待
 	convert_finish_flag = 0;
 
-	if(bit_count == 66){
+	if(flag_recive_mode == WG_66_MODE){
 		err = copy_to_user(buf, &barcode_66, sizeof(unsigned long long));
 		if(err){
 			printk("%s copy_to_user error(%d)\n", __func__, err);
@@ -638,8 +652,10 @@ ssize_t wiegand_read(struct file *file, char __user *buf, size_t size, loff_t *p
 			return -1;
 		}
 	}
-
+	flag_recive_mode = WG_UNKNOWN_MODE;
 	bit_count = 0;
+	barcode_66 = 0;
+	barcode= 0;
 
 	//disable_irq_nosync(gpio_to_irq(wiegand_set[0].pin_num));
 	//disable_irq_nosync(gpio_to_irq(wiegand_set[1].pin_num));
@@ -678,21 +694,7 @@ static struct file_operations wiegand_fops = {
 	.poll = wiegand_poll,
 };
 
-static int wiegand_convert_thread(void *data)
-{
-	while(1){
-		set_current_state(TASK_UNINTERRUPTIBLE);//将当前的状态表示设置为休眠
-		if(kthread_should_stop()) 
-			break;
-		if(flag_recive_mode != WG_UNKNOWN_MODE){
-			recive_data_convert();
-			flag_recive_mode = WG_UNKNOWN_MODE;
-		}else{
-			schedule_timeout(HZ/10);// 100ms
-		}
-	}
-	return 0;
-}
+
 
 static int __init wiegand_init(void)
 {
@@ -732,12 +734,13 @@ static int __init wiegand_init(void)
 			}
 
 		}else{
-			err = gpio_direction_output(wiegand_set[i].pin_num, 1);
+			err = gpio_direction_output(wiegand_set[i].pin_num, 0);
 			if (err < 0) {
 				printk("Cannot set the gpio to output mode. \n");
 				gpio_free(wiegand_set[i].pin_num);
 				goto out;
 			}
+			gpio_set_value(wiegand_set[i].pin_num, 0);			
 		}
 	}
 
@@ -760,43 +763,19 @@ static int __init wiegand_init(void)
 	//disable_irq_nosync(gpio_to_irq(wiegand_set[0].pin_num));
 	//disable_irq_nosync(gpio_to_irq(wiegand_set[1].pin_num));
 
-	wiegand_convert_task = kthread_create(wiegand_convert_thread, NULL, "wiegand_convert_task");
-	if(IS_ERR(wiegand_convert_task)){
-		printk("Unable to start kernel thread.\n");
-		err = PTR_ERR(wiegand_convert_task);
-		wiegand_convert_task = NULL;
-		goto out1;
-	}
-
 	return 0;
 out:
 	while(i--){
 		gpio_free(wiegand_set[i].pin_num);
 	}
 	return -1;
-
-out1:
-	del_timer(&refresh_timer);
-	for(i = 0; i < ARRAY_SIZE(wiegand_set); i++){
-		if(wiegand_set[i].flag_input){
-			free_irq(gpio_to_irq(wiegand_set[i].pin_num), &wiegand_set[i]);
-		}
-		gpio_free(wiegand_set[i].pin_num);
-	}
-	device_destroy(cls, devid);
-	class_destroy(cls);
-	cdev_del(&wiegand_cdev);
-	unregister_chrdev_region(devid, 1);
-	return -1;
+	
 }
 
 static void __exit wiegand_exit(void)
 {
 	int i; 
-	if(wiegand_convert_task){
-		kthread_stop(wiegand_convert_task);
-		wiegand_convert_task = NULL;
-	}
+
 	del_timer(&refresh_timer);
 	for(i = 0; i < ARRAY_SIZE(wiegand_set); i++){
 		if(wiegand_set[i].flag_input){
